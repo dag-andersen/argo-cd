@@ -349,6 +349,16 @@ message ListAppLinksRequest {
 	optional string project = 4;
 }
 
+// ApplicationRenderManifestRequest is a request to render manifests for an Application
+// without requiring the Application to exist in the cluster.
+message ApplicationRenderManifestRequest {
+	required github.com.argoproj.argo_cd.v3.pkg.apis.application.v1alpha1.Application application = 1;
+	// kubeVersion is the Kubernetes version to use for Helm capabilities. Optional - if not set, Helm defaults are used.
+	optional string kubeVersion = 2;
+	// apiVersions is the list of supported API versions for Helm capabilities. Optional.
+	repeated string apiVersions = 3;
+	optional bool noCache = 4;
+}
 
 // ApplicationService
 service ApplicationService {
@@ -547,5 +557,15 @@ service ApplicationService {
 	// ListResourceLinks returns the list of all resource deep links
 	rpc ListResourceLinks(ApplicationResourceRequest) returns (LinksResponse) {
 		option (google.api.http).get = "/api/v1/applications/{name}/resource/links";
+	}
+
+	// RenderManifests renders manifests for a given Application spec without requiring
+	// the Application to exist in the cluster. This is useful for previewing what
+	// manifests an Application would produce at a given revision.
+	rpc RenderManifests (ApplicationRenderManifestRequest) returns (repository.ManifestResponse) {
+		option (google.api.http) = {
+			post: "/api/v1/applications/render"
+			body: "*"
+		};
 	}
 }

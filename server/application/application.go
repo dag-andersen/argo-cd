@@ -647,6 +647,166 @@ func (s *Server) GetManifests(ctx context.Context, q *application.ApplicationMan
 	return manifests, nil
 }
 
+// RenderManifests renders manifests for a given Application spec without requiring
+// the Application to exist in the cluster. This is useful for previewing what
+// manifests an Application would produce at a given revision.
+func (s *Server) RenderManifests(ctx context.Context, q *application.ApplicationRenderManifestRequest) (*apiclient.ManifestResponse, error) {
+	a := q.GetApplication()
+	if a == nil {
+		return nil, errors.New("invalid request: application is missing")
+	}
+	if a.Spec.GetSource().RepoURL == "" && !a.Spec.HasMultipleSources() {
+		return nil, errors.New("invalid request: application source is missing")
+	}
+
+	// Resolve the project - default to "default" if not specified
+	projectName := a.Spec.GetProject()
+	if projectName == "" {
+		projectName = "default"
+		a.Spec.Project = "default"
+	}
+
+	// Enforce RBAC - the user must have get permission on applications in this project
+	appName := a.Name
+	if appName == "" {
+		appName = "*"
+	}
+	appNs := a.Namespace
+	if appNs == "" {
+		appNs = s.ns
+	}
+	rbacName := security.RBACName(s.ns, projectName, appNs, appName)
+	if err := s.enf.EnforceErr(ctx.Value("claims"), rbac.ResourceApplications, rbac.ActionGet, rbacName); err != nil {
+		return nil, argocommon.PermissionDeniedAPIError
+	}
+
+	// Get the project
+	proj, err := argo.GetAppProjectByName(ctx, projectName, applisters.NewAppProjectLister(s.projInformer.GetIndexer()), s.ns, s.settingsMgr, s.db)
+	if err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "error getting project %q: %v", projectName, err)
+	}
+
+	manifestInfos := make([]*apiclient.ManifestResponse, 0)
+	err = s.queryRepoServer(ctx, proj, func(
+		client apiclient.RepoServerServiceClient,
+		helmRepos []*v1alpha1.Repository,
+		helmCreds []*v1alpha1.RepoCreds,
+		ociRepos []*v1alpha1.Repository,
+		ociCreds []*v1alpha1.RepoCreds,
+		helmOptions *v1alpha1.HelmOptions,
+		enableGenerateManifests map[string]bool,
+	) error {
+		appInstanceLabelKey, err := s.settingsMgr.GetAppInstanceLabelKey()
+		if err != nil {
+			return fmt.Errorf("error getting app instance label key from settings: %w", err)
+		}
+
+		// Use provided kubeVersion/apiVersions, or leave empty for Helm defaults
+		serverVersion := q.GetKubeVersion()
+		apiVersions := q.GetApiVersions()
+
+		sources := make([]v1alpha1.ApplicationSource, 0)
+		if a.Spec.HasMultipleSources() {
+			sources = a.Spec.GetSources()
+		} else {
+			sources = append(sources, a.Spec.GetSource())
+		}
+
+		// Store the map of all sources having ref field into a map for applications with sources field
+		refSources, err := argo.GetRefSources(context.Background(), sources, projectName, s.db.GetRepository, []string{})
+		if err != nil {
+			return fmt.Errorf("failed to get ref sources: %w", err)
+		}
+
+		for _, source := range sources {
+			repo, err := s.db.GetRepository(ctx, source.RepoURL, proj.Name)
+			if err != nil {
+				return fmt.Errorf("error getting repository: %w", err)
+			}
+
+			kustomizeSettings, err := s.settingsMgr.GetKustomizeSettings()
+			if err != nil {
+				return fmt.Errorf("error getting kustomize settings: %w", err)
+			}
+
+			installationID, err := s.settingsMgr.GetInstallationID()
+			if err != nil {
+				return fmt.Errorf("error getting installation ID: %w", err)
+			}
+			trackingMethod, err := s.settingsMgr.GetTrackingMethod()
+			if err != nil {
+				return fmt.Errorf("error getting trackingMethod from settings: %w", err)
+			}
+
+			repos := helmRepos
+			helmRepoCreds := helmCreds
+			if source.IsOCI() {
+				repos = slices.Clone(helmRepos)
+				helmRepoCreds = slices.Clone(helmCreds)
+				repos = append(repos, ociRepos...)
+				helmRepoCreds = append(helmRepoCreds, ociCreds...)
+			}
+
+			manifestInfo, err := client.GenerateManifest(ctx, &apiclient.ManifestRequest{
+				Repo:                            repo,
+				Revision:                        source.TargetRevision,
+				AppLabelKey:                     appInstanceLabelKey,
+				AppName:                         a.InstanceName(s.ns),
+				Namespace:                       a.Spec.Destination.Namespace,
+				ApplicationSource:               &source,
+				Repos:                           repos,
+				KustomizeOptions:                kustomizeSettings,
+				KubeVersion:                     serverVersion,
+				ApiVersions:                     apiVersions,
+				HelmRepoCreds:                   helmRepoCreds,
+				HelmOptions:                     helmOptions,
+				TrackingMethod:                  trackingMethod,
+				EnabledSourceTypes:              enableGenerateManifests,
+				ProjectName:                     proj.Name,
+				ProjectSourceRepos:              proj.Spec.SourceRepos,
+				HasMultipleSources:              a.Spec.HasMultipleSources(),
+				RefSources:                      refSources,
+				AnnotationManifestGeneratePaths: a.GetAnnotation(v1alpha1.AnnotationKeyManifestGeneratePaths),
+				InstallationID:                  installationID,
+				NoCache:                         q.NoCache != nil && *q.NoCache,
+			})
+			if err != nil {
+				return fmt.Errorf("error generating manifests: %w", err)
+			}
+			manifestInfos = append(manifestInfos, manifestInfo)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	manifests := &apiclient.ManifestResponse{}
+	for _, manifestInfo := range manifestInfos {
+		for i, manifest := range manifestInfo.Manifests {
+			obj := &unstructured.Unstructured{}
+			err = json.Unmarshal([]byte(manifest), obj)
+			if err != nil {
+				return nil, fmt.Errorf("error unmarshaling manifest into unstructured: %w", err)
+			}
+			if obj.GetKind() == kube.SecretKind && obj.GroupVersionKind().Group == "" {
+				obj, _, err = diff.HideSecretData(obj, nil, s.settingsMgr.GetSensitiveAnnotations())
+				if err != nil {
+					return nil, fmt.Errorf("error hiding secret data: %w", err)
+				}
+				data, err := json.Marshal(obj)
+				if err != nil {
+					return nil, fmt.Errorf("error marshaling manifest: %w", err)
+				}
+				manifestInfo.Manifests[i] = string(data)
+			}
+		}
+		manifests.Manifests = append(manifests.Manifests, manifestInfo.Manifests...)
+	}
+
+	return manifests, nil
+}
+
 func (s *Server) GetManifestsWithFiles(stream application.ApplicationService_GetManifestsWithFilesServer) error {
 	ctx := stream.Context()
 	query, err := manifeststream.ReceiveApplicationManifestQueryWithFiles(stream)
